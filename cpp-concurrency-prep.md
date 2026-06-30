@@ -199,17 +199,25 @@ void unsafe_shared_value_increment(){
     // shared_value_lock.unlock(); mutex is not being unlocked -> nothing else can lock the mutex -> nothing else can proceed with updating the value
 }
 
-void unsafe_shared_value_increment(){
-    shared_value_lock.lock(); // now all threads will wait until they get to lock
-        try{
-            shared_value = shared_value + 1; 
-            throw "dangerous ... abort";
-        } catch (...){
-            cout << "exception occured" << endl;
-        }
-   
-    shared_value_lock.unlock(); // this is skipped when the exception is thrown
+// Version where unlock IS skipped:
+void truly_unsafe() {
+    shared_value_lock.lock();
+    shared_value = shared_value + 1;
+    throw "dangerous ... abort";       // exception propagates OUT of the function
+    shared_value_lock.unlock();        // genuinely never reached — lock stays held forever
 }
+
+// Version where catch re-throws:
+void also_unsafe() {
+    shared_value_lock.lock();
+    try {
+        throw "dangerous ... abort";
+    } catch (...) {
+        throw;                         // re-throws — exception propagates out
+    }
+    shared_value_lock.unlock();        // never reached
+}
+
 ```
 ofcourse we can manually make sure that every exit has the unlock. We can also use a `lock_guard` which is a mutex wrapper. Once its scope is over, the object it is holding (the mutex) is unlocked
 
@@ -596,6 +604,14 @@ p.set_value(r);  // caller's future.get() now unblocks
 **Key detail:** `promise` is move-only (like a channel you hand off). You can't copy it — you `std::move` it into the queue entry.
 
 # Types of bugs/patterns to identify
+## Why do we need sync? re-ordering
+There are two independent reorderers sitting between your source code and what another thread actually observes:
+
+The compiler — it can move, merge, eliminate, or reorder memory operations when emitting instructions, as long as a single thread executing in isolation can't tell the difference. It has no obligation to preserve the order as seen by other threads, unless you use a synchronization primitive.
+The CPU — even after the compiler emits instructions in a fixed order, the hardware can execute and make visible stores and loads out of order (store buffers, out-of-order execution, cache coherency delays). On x86 this is relatively mild; on ARM/POWER it's aggressive. So even with perfect compiler output, thread B can observe thread A's writes in a different order than A issued them.
+
+Both are governed by the same rule: single-threaded behavior must be preserved, but inter-thread visibility order is fair game unless you synchronize. 
+
 ## Data race
 Starting with #1. I'll keep to your format and stop after.
 
@@ -1182,3 +1198,292 @@ void waiter() {
 The textual tells, scanning: inside a `lock_guard`/`unique_lock` scope, look for `read`, `write`, `recv`, `send`, `fopen`, `fread`, any filesystem or socket call; `sleep_for`/`sleep_until`/`yield`; `std::async`, `future.get()`, `thread::join`; `new`/`malloc`/large container resize; a second lock acquisition; a call to a function pointer / `std::function` / virtual method that could be overridden (callback into unknown code); or a `while(...)`/`for(;;)` spin with no `wait`. The meta-tell is *duration mismatch*: the lock's name or purpose says "protect a small data structure," but the body contains something whose cost is unbounded or whose completion depends on another thread. Whenever the thing under the lock can *block on another thread*, ask whether that other thread needs this same lock — if yes, it's not slow, it's deadlocked.
 
 The interview move: when you spot slow work under a lock, separate the two failure modes explicitly — "if this just blocks on external latency it's a throughput bug, fix by doing it outside the lock with a re-check on commit; if the blocked-on event can only be produced by a thread that needs *this* lock, it's a deadlock, and the fix is `cv.wait` which releases the lock while parked, or restructuring so the lock isn't held across the wait." Naming which of the two you're looking at, and that `cv.wait`'s lock-release is the thing that makes waiting-under-lock safe, is what shows you understand the mechanism rather than the slogan.
+
+## 9. Broken double-checked locking (DCL)
+If we want to create something only once. First itnuitive solution is to 
+```cpp
+Widget* instance = nullptr;
+
+Widget* get() {
+    std::lock_guard<std::mutex> g(m);
+    if (instance == nullptr)
+        instance = new Widget();       // runs once
+    return instance;
+}
+```
+
+but this has a problem; acquiring lock even if we will not make anything. millions of future calls will be serialised
+we might be tempted to do a double check of sorts
+```cpp
+Widget* get() {
+    if (instance != nullptr)      // fast path: already built? just return it, no lock
+        return instance;
+    std::lock_guard<std::mutex> g(m);
+    if (instance == nullptr)      // re-check under lock (another thread may have built it
+        instance = new Widget();  // while we were waiting for the lock)
+    return instance;
+}
+```
+has some problems with 
+- reoredering
+- t1 can write in line 5 while t2 reads without a check in line 2. RACE CONDITION
+
+simplest thing to do is use a function local static variable
+```cpp
+Widget& get() {
+    static Widget instance;
+    return instance;
+}
+```
+### difference between weidget& get() and widget* get()
+Not quite — a reference is an **alias** for the object, not its address. Both a reference and a pointer let you access the same underlying object without copying it, but they differ in two ways that matter:
+
+```cpp
+Widget& get();    // returns a REFERENCE — an alias to the object
+Widget* get();    // returns a POINTER — holds the address of the object
+```
+
+**Reference (`Widget&`):** the caller uses it like a plain object. Can't be null. Can't be reassigned to point elsewhere.
+
+```cpp
+Widget& w = get();
+w.doThing();          // dot syntax, as if w IS the object
+```
+
+**Pointer (`Widget*`):** the caller gets an address. Can be null. Must dereference.
+
+```cpp
+Widget* w = get();
+w->doThing();         // arrow syntax, dereference
+(*w).doThing();       // equivalent
+```
+
+Under the hood, a reference is typically implemented as a pointer by the compiler — but at the language level, it's an alias, not an address. The reason the static-local version returns `Widget&` rather than `Widget*` is that the object *always* exists after first call (it can never be null), so a reference is the natural contract: "here's the thing, guaranteed present."
+
+If you returned `Widget*`, the caller would have to consider the possibility of null, which can't actually happen here — the reference communicates that guarantee in the type.
+
+## 10. Escaping reference
+## 10. Escaping reference
+
+**Theory.** You return (or store) a pointer or reference to data that lives inside a lock-protected structure, and the caller uses it *after* the lock has been released. The access itself looks fine — no missing lock, no race at the point of creation — but the reference outlives the critical section, so the caller is reading (or writing) shared state with no lock held. Worse, the underlying container may mutate (rehash, realloc, erase) while the escaped reference dangles, so it's not just a race but a potential use-after-free or iterator invalidation (bridge to #11). The mechanism: the lock protects the *lookup*, but the thing handed back is a backdoor past the lock.
+
+**Broken — returning a reference into a locked map:**
+
+```cpp
+class Cache {
+    std::mutex m;
+    std::unordered_map<int, std::string> data;
+public:
+    std::string& get(int k) {                   // returns a REFERENCE into the map
+        std::lock_guard<std::mutex> g(m);
+        return data[k];                          // BUG: reference is valid right now,
+    }                                            // but lock drops at '}'. Caller holds
+};                                               // a bare reference into `data` with
+                                                 // no lock protecting it.
+// Usage:
+//   std::string& val = cache.get(42);
+//   // ... lock is GONE here ...
+//   std::cout << val;                           // RACE: another thread may be writing
+//                                               // data[42], or inserting a new key
+//                                               // which triggers rehash -> val now
+//                                               // points to freed memory -> UB / crash
+//
+// Interleaving:
+//   thread A: get(42), lock, gets ref to data[42], UNLOCK, ref escapes
+//   thread B: get(99), lock, data[99] triggers rehash -> all nodes move
+//   thread A: reads through ref -> dangling pointer, memory may be reused -> garbage
+```
+
+The same bug in pointer-to-element flavor:
+
+```cpp
+class Pool {
+    std::mutex m;
+    std::vector<Buffer> bufs;
+public:
+    Buffer* acquire() {
+        std::lock_guard<std::mutex> g(m);
+        bufs.emplace_back();
+        return &bufs.back();                    // BUG: pointer into vector storage
+    }                                           // another thread's emplace_back may
+};                                              // realloc the vector -> pointer dangles
+```
+
+**Fix — return a copy, not a reference:**
+
+```cpp
+class Cache {
+    std::mutex m;
+    std::unordered_map<int, std::string> data;
+public:
+    std::string get(int k) {                     // returns by VALUE — a copy
+        std::lock_guard<std::mutex> g(m);
+        return data[k];                          // copy made UNDER the lock; caller
+    }                                            // owns an independent string, no
+};                                               // dangling reference, no race
+```
+
+When copying is too expensive (large objects, non-copyable types), you have two other options:
+
+```cpp
+// Option A: return a shared_ptr — the object survives even if the map entry is
+// erased or the map rehashes, because shared_ptr ref-counts the allocation.
+class Cache {
+    std::mutex m;
+    std::unordered_map<int, std::shared_ptr<Widget>> data;
+public:
+    std::shared_ptr<Widget> get(int k) {
+        std::lock_guard<std::mutex> g(m);
+        return data[k];                          // caller gets a ref-counted handle;
+    }                                            // Widget stays alive as long as any
+};                                               // shared_ptr holds it, regardless of
+                                                 // what happens to the map
+```
+
+```cpp
+// Option B: hold the lock in the caller's scope via a handle that bundles the
+// lock + access. The reference is valid as long as the handle lives.
+class Cache {
+    std::mutex m;
+    std::unordered_map<int, std::string> data;
+public:
+    struct Handle {
+        std::unique_lock<std::mutex> lk;
+        std::string& ref;
+    };
+
+    Handle get(int k) {
+        std::unique_lock<std::mutex> lk(m);
+        auto& ref = data[k];
+        return Handle{std::move(lk), ref};       // lock moves into the Handle; ref is
+    }                                            // valid as long as Handle is alive.
+};                                               // caller: auto h = cache.get(42);
+                                                 // use h.ref;  // lock still held
+                                                 // }           // Handle destructs -> unlock
+// Tradeoff: this holds the lock longer (until the caller is done), which is the
+// over-serialization (#13) direction. But it's correct. The caller controls scope.
+```
+
+**Where it shows up / the tells.** Any API that returns `T&` or `T*` into a shared container: `map::operator[]` returning a reference, `vector::back()` returning a reference, `front()` on a shared queue. Buffer pools returning raw `Buffer*` into a vector/deque. A `find()` that returns an iterator which the caller dereferences outside the lock — the iterator is morally a pointer, same bug. Thread-safe wrappers around STL containers that try to mimic the STL interface (returning references/iterators) — the interface itself is hostile to thread safety because it's designed around escaping references. Accessor methods like `const std::string& name() const` on objects shared across threads — the reference escapes, the object may be mutated concurrently.
+
+The textual tells, scanning: a function that takes a lock internally and returns `T&`, `T*`, `const T&`, or an iterator into the locked structure — the return type is the smell. The lock is scoped to the function body but the return value's validity depends on the data's stability, which the caller can't guarantee without the lock. Any place you see `return data[k];` or `return &vec.back();` inside a locked method and the return type isn't by-value — that's it. Also watch for callers that store the returned reference/pointer in a local and use it across subsequent code that may interleave with other threads' mutations of the same container. The "I locked the lookup" false confidence: the developer thought the lock on the lookup was enough, forgetting the reference is a live wire back into the structure.
+
+The interview move: when you spot a locked method returning a reference, say "this reference escapes the critical section — after the lock drops, any concurrent insert, erase, or rehash can invalidate it, giving a use-after-free or a data race. The fix is return by value, or return a `shared_ptr` for ownership, or bundle the lock into a handle so the caller holds it while using the reference — each trades off copy cost vs. lock duration."
+
+## 11. iterator/pointer invalidation
+## 11. Iterator / pointer invalidation
+
+**Theory.** A thread holds an iterator (or pointer, or index) obtained from a container, and another thread mutates the container in a way that invalidates that iterator — insert triggering rehash/realloc, erase removing the node, clear. The first thread then dereferences the invalidated iterator: use-after-free, garbage read, or crash. This is #10 (escaping reference) generalized to iterators, but it has its own distinct shape because the invalidation isn't just "someone wrote to the same slot" — it's "the slot moved or ceased to exist." Even a single-threaded program can hit iterator invalidation; concurrency makes it worse because the mutation is invisible to the holder and can happen at any point between obtaining the iterator and using it.
+
+**Broken — iterating while another thread inserts:**
+
+```cpp
+std::unordered_map<int, Data> table;
+std::mutex m;
+
+void reader() {
+    std::unique_lock<std::mutex> lk(m);
+    auto it = table.find(42);                // iterator obtained under lock
+    lk.unlock();                             // lock released — iterator escapes (same
+                                             // smell as #10, but now it's an iterator)
+    if (it != table.end())
+        process(it->second);                 // BUG: between unlock and here, another
+}                                            // thread may have inserted, triggering a
+                                             // rehash. Rehash moves every node's bucket
+                                             // chain -> `it` points to freed/moved memory.
+
+void writer() {
+    std::lock_guard<std::mutex> g(m);
+    table[999] = Data{};                     // innocent insert — but if load factor
+}                                            // exceeds threshold, rehash invalidates
+                                             // ALL iterators. reader's `it` is now junk.
+
+// Interleaving:
+//   reader: lock, find(42) -> it (valid), UNLOCK
+//   writer: lock, table[999] triggers rehash, all iterators invalidated, unlock
+//   reader: it->second  -> dangling -> UB / crash
+```
+
+**The vector version is even more common:**
+
+```cpp
+std::vector<Task> tasks;
+std::mutex m;
+
+void consumer() {
+    std::unique_lock<std::mutex> lk(m);
+    auto it = tasks.begin();
+    lk.unlock();                             // BUG: iterator escapes the lock
+
+    while (it != tasks.end()) {              // this end() is itself a STALE call —
+        process(*it);                        // if producer push_back'd, end() moved,
+        ++it;                                // and if push_back reallocated, `it`
+    }                                        // points into freed storage
+}
+
+void producer() {
+    std::lock_guard<std::mutex> g(m);
+    tasks.push_back(Task{});                 // push_back may realloc -> ALL iterators,
+}                                            // pointers, references into `tasks` are
+                                             // invalidated
+```
+
+**Fix — keep the lock held for the entire iteration, or snapshot:**
+
+```cpp
+// Option A: hold the lock while iterating (simple, correct, may over-serialize)
+void consumer() {
+    std::lock_guard<std::mutex> g(m);
+    for (auto& t : tasks)                    // iterators valid because no one else can
+        process(t);                          // mutate `tasks` while we hold m
+}
+
+// Option B: snapshot the data, release lock, iterate the private copy
+void consumer() {
+    std::vector<Task> snapshot;
+    {
+        std::lock_guard<std::mutex> g(m);
+        snapshot = tasks;                    // copy under lock -> snapshot is private
+    }
+    for (auto& t : snapshot)                 // iterate the copy; original can be
+        process(t);                          // freely mutated by other threads, doesn't
+}                                            // affect our snapshot. No lock held during
+                                             // the slow work.
+
+// Option C: copy pointers/indices under lock, dereference under lock per-element
+// (fine-grained; useful when the iteration is long and you don't want to hold
+// the lock the whole time OR copy the whole container)
+void consumer() {
+    std::vector<int> keys;
+    {
+        std::lock_guard<std::mutex> g(m);
+        for (auto& [k, v] : table)
+            keys.push_back(k);              // copy just the keys — cheap
+    }
+    for (int k : keys) {
+        std::lock_guard<std::mutex> g(m);
+        auto it = table.find(k);            // re-lookup under lock each time
+        if (it != table.end())              // key may have been erased since snapshot
+            process(it->second);            // — that's fine, we just skip it
+    }
+}
+```
+
+Which container mutations invalidate which iterators is worth knowing cold, because the interviewer may ask "is this safe?" and the answer depends on the container:
+
+**`std::vector`** — insert/push_back can realloc → **all** iterators, pointers, references invalidated. Erase invalidates from the erased point onward. This is the most dangerous one.
+
+**`std::deque`** — insert/erase in the middle invalidates **all** iterators. Insert at front/back invalidates iterators but **not** references/pointers to elements (the elements don't move, but the index bookkeeping changes).
+
+**`std::unordered_map/set`** — insert may rehash → **all** iterators invalidated (references/pointers to elements survive rehash, but iterators don't). Erase invalidates only the erased element's iterator.
+
+**`std::map/set`** — insert/erase invalidate **only** the erased element's iterator. All other iterators remain valid. This is the safest container for concurrent-iteration patterns, and why you sometimes see engine code prefer `std::map` over `unordered_map` despite the O(log n) cost — iterator stability is a concurrency asset.
+
+**`std::list`** — same as map: only the erased element's iterator is invalidated. Insert never invalidates anything.
+
+## 12. ABA
+Theory. Compare-and-swap (CAS) asks "is the value still X? if so, swap it to Y." ABA is when the value was X, changed to something else, and changed back to X before your CAS fires. CAS sees X, concludes "nothing changed," and succeeds — but the world did change in between, and the assumptions you made when you captured X are stale. The value matching doesn't mean the state is the same. CAS checks identity of bits, not identity of history. The mechanism is that CAS has no notion of "version" — it compares a snapshot, and snapshots can repeat.
+
+some tagged pointer stuff (can ignore. fcous on the rest)
+## 13. Over-serialisation
+dont lock the entire thing under the lock. only the shared reads-writes need to be in the critical section!
